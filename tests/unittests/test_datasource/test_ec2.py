@@ -2,11 +2,35 @@
 
 import copy
 import httpretty
+import json
 import mock
 
 from cloudinit import helpers
 from cloudinit.sources import DataSourceEc2 as ec2
 from cloudinit.tests import helpers as test_helpers
+
+
+DYNAMIC_METADATA = {
+    "instance-identity": {
+        "document": json.dumps({
+            "devpayProductCodes": None,
+            "marketplaceProductCodes": ["1abc2defghijklm3nopqrs4tu"],
+            "availabilityZone": "us-west-2b",
+            "privateIp": "10.158.112.84",
+            "version": "2017-09-30",
+            "instanceId": "my-identity-id",
+            "billingProducts": None,
+            "instanceType": "t2.micro",
+            "accountId": "123456789012",
+            "imageId": "ami-5fb8c835",
+            "pendingTime": "2016-11-19T16:32:11Z",
+            "architecture": "x86_64",
+            "kernelId": None,
+            "ramdiskId": None,
+            "region": "us-west-2"
+        })
+    }
+}
 
 
 # collected from api version 2016-09-02/ with
@@ -85,7 +109,7 @@ DEFAULT_METADATA = {
     "public-keys": {"brickies": ["ssh-rsa AAAAB3Nz....w== brickies"]},
     "reservation-id": "r-01efbc9996bac1bd6",
     "security-groups": "my-wide-open",
-    "services": {"domain": "amazonaws.com", "partition": "aws"}
+    "services": {"domain": "amazonaws.com", "partition": "aws"},
 }
 
 
@@ -186,6 +210,7 @@ class TestEc2(test_helpers.HttprettyTestCase):
         super(TestEc2, self).setUp()
         self.datasource = ec2.DataSourceEc2
         self.metadata_addr = self.datasource.metadata_urls[0]
+        self.tmp = self.tmp_dir()
 
     def data_url(self, version):
         """Return a metadata url based on the version provided."""
@@ -199,7 +224,7 @@ class TestEc2(test_helpers.HttprettyTestCase):
     def _setup_ds(self, sys_cfg, platform_data, md, md_version=None):
         self.uris = []
         distro = {}
-        paths = helpers.Paths({})
+        paths = helpers.Paths({'run_dir': self.tmp})
         if sys_cfg is None:
             sys_cfg = {}
         ds = self.datasource(sys_cfg=sys_cfg, distro=distro, paths=paths)
@@ -329,7 +354,8 @@ class TestEc2(test_helpers.HttprettyTestCase):
         ds.fallback_nic = 'eth9'
         with mock.patch(get_interface_mac_path) as m_get_interface_mac:
             m_get_interface_mac.return_value = mac1
-            ds.network_config  # Will re-crawl network metadata
+            nc = ds.network_config  # Will re-crawl network metadata
+            self.assertIsNotNone(nc)
         self.assertIn('Re-crawl of metadata service', self.logs.getvalue())
         expected = {'version': 1, 'config': [
             {'mac_address': '06:17:04:d7:26:09',
@@ -337,6 +363,39 @@ class TestEc2(test_helpers.HttprettyTestCase):
              'subnets': [{'type': 'dhcp4'}, {'type': 'dhcp6'}],
              'type': 'physical'}]}
         self.assertEqual(expected, ds.network_config)
+
+    @httpretty.activate
+    def test_ec2_get_instance_id_refreshes_identity_on_upgrade(self):
+        """get_instance-id gets DataSourceEc2Local.identity if not present.
+
+        This handles an upgrade case where the old pickled datasource didn't
+        set up self.identity, but 'systemctl cloud-init init' runs
+        get_instance_id which traces on missing self.identity. lp:1748354.
+        """
+        self.datasource = ec2.DataSourceEc2Local
+        ds = self._setup_ds(
+            platform_data=self.valid_platform_data,
+            sys_cfg={'datasource': {'Ec2': {'strict_id': False}}},
+            md=DEFAULT_METADATA)
+        # Mock 404s on all versions except latest
+        all_versions = (
+            [ds.min_metadata_version] + ds.extended_metadata_versions)
+        for ver in all_versions[:-1]:
+            register_mock_metaserver(
+                'http://169.254.169.254/{0}/meta-data/instance-id'.format(ver),
+                None)
+        ds.metadata_address = 'http://169.254.169.254'
+        register_mock_metaserver(
+            '{0}/{1}/meta-data/'.format(ds.metadata_address, all_versions[-1]),
+            DEFAULT_METADATA)
+        # Register dynamic/instance-identity document which we now read.
+        register_mock_metaserver(
+            '{0}/{1}/dynamic/'.format(ds.metadata_address, all_versions[-1]),
+            DYNAMIC_METADATA)
+        ds._cloud_platform = ec2.Platforms.AWS
+        # Setup cached metadata on the Datasource
+        ds.metadata = DEFAULT_METADATA
+        self.assertEqual('my-identity-id', ds.get_instance_id())
 
     @httpretty.activate
     @mock.patch('cloudinit.net.dhcp.maybe_perform_dhcp_discovery')
@@ -423,7 +482,7 @@ class TestEc2(test_helpers.HttprettyTestCase):
             self.logs.getvalue())
 
     @httpretty.activate
-    @mock.patch('cloudinit.net.EphemeralIPv4Network')
+    @mock.patch('cloudinit.net.dhcp.EphemeralIPv4Network')
     @mock.patch('cloudinit.net.find_fallback_nic')
     @mock.patch('cloudinit.net.dhcp.maybe_perform_dhcp_discovery')
     @mock.patch('cloudinit.sources.DataSourceEc2.util.is_FreeBSD')
